@@ -45,11 +45,13 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from terminaltexteffects.effects.effect_slide     import Slide
-    from terminaltexteffects.effects.effect_smoke     import Smoke
-    from terminaltexteffects.effects.effect_sweep     import Sweep
-    from terminaltexteffects.effects.effect_synthgrid import SynthGrid
-    from terminaltexteffects.effects.effect_wipe      import Wipe
+    from terminaltexteffects.effects.effect_slide      import Slide
+    from terminaltexteffects.effects.effect_smoke      import Smoke
+    from terminaltexteffects.effects.effect_sweep      import Sweep
+    from terminaltexteffects.effects.effect_synthgrid  import SynthGrid
+    from terminaltexteffects.effects.effect_wipe       import Wipe
+    from terminaltexteffects.effects.effect_colorshift import ColorShift
+    from terminaltexteffects.effects.effect_waves      import Waves
     TTE_OK = True
 except ImportError:
     TTE_OK = False
@@ -253,8 +255,15 @@ def _render_bar(rs: RenderState) -> Text:
              else "color(241)")
 
     bar = Text(no_wrap=True, overflow="ellipsis")
-    bar.append("  qodo ", style=f"bold {C_BRAND}")
-    bar.append(sp, style=f"bold {pulse_c}")
+
+    # Brand segment — animated by ColorShift idle heartbeat
+    if rs.seg_segment == "brand" and rs.seg_frame is not None:
+        bar.append("  ")
+        bar.append_text(_frame_to_text(rs.seg_frame))
+    else:
+        bar.append("  qodo ", style=f"bold {C_BRAND}")
+        bar.append(sp, style=f"bold {pulse_c}")
+
     bar.append(f"  {C_BAR}  ", style=C_BRAND)
     bar.append(d.label, style=shimmer)
     bar.append(f"  {C_BAR}  ", style=C_BRAND)
@@ -298,6 +307,10 @@ def _render(rs: RenderState, console: Console) -> Panel:
     effect_hint = Text(no_wrap=True)
     if rs.active_effect:
         effect_hint.append(f"  ▶ {rs.active_effect}", style="bold color(69)")
+    elif rs.seg_segment == "brand":
+        effect_hint.append("  ◈ ColorShift  [idle heartbeat]", style="dim color(135)")
+    elif rs.bar_frame is not None:
+        effect_hint.append("  ◈ Waves  [warm activity]", style="dim color(77)")
     else:
         effect_hint.append("  ○ idle — waiting for transition", style="dim")
 
@@ -376,37 +389,191 @@ async def _play_transition(
         refresh()
 
 
+# ── Continuous alive animations ──────────────────────────────────────────────
+#
+# Three layers — each fills a different purpose:
+#
+#  1. _shimmer_tick     — 10fps palette refresh, no TTE.
+#                         Directly mirrors statusline.c's clock-based frame index.
+#                         Makes the ⛨ pulse and label shimmer cycle visually.
+#
+#  2. _anim_idle_loop   — ColorShift on "qodo ⛨" while IDLE (>4s since last tool).
+#                         Subtle breathing effect — "daemon is alive, nothing happening."
+#                         Replays every ~8s. Cancelled the moment a transition fires.
+#
+#  3. _anim_warm_loop   — Waves on the full bar while WARM (500ms–4s since tool call).
+#                         More energetic — "daemon just processed something."
+#                         Cancelled when activity_ms crosses back to IDLE or goes HOT.
+#
+# Priority: transition animation > warm loop > idle loop > shimmer tick.
+# Any higher-priority animation cancels lower-priority ones cleanly.
+
+
+async def _shimmer_tick(rs: RenderState, refresh, stop: asyncio.Event) -> None:
+    """10fps tick — cycles the palette frame index so shimmer colors animate."""
+    while not stop.is_set():
+        refresh()
+        await asyncio.sleep(0.1)
+
+
+async def _anim_idle_loop(rs: RenderState, refresh, stop: asyncio.Event) -> None:
+    """ColorShift on 'qodo ⛨' — subtle heartbeat while daemon is idle."""
+    brand_text = "qodo ⛨"
+    try:
+        while not stop.is_set():
+            # Only play when genuinely idle and no other animation is active
+            if rs.bar_frame is None and rs.seg_frame is None and not rs.active_effect:
+                try:
+                    frames = await asyncio.to_thread(
+                        _gen_frames, ColorShift, brand_text, 60
+                    )
+                except Exception:
+                    await asyncio.sleep(2.0)
+                    continue
+                for frame in frames:
+                    if stop.is_set() or rs.bar_frame is not None or rs.active_effect:
+                        break
+                    rs.seg_segment = "brand"
+                    rs.seg_frame   = frame
+                    refresh()
+                    await asyncio.sleep(1 / 30)
+                rs.seg_segment = None
+                rs.seg_frame   = None
+                refresh()
+            # Rest between heartbeats
+            await asyncio.sleep(6.0)
+    except asyncio.CancelledError:
+        rs.seg_segment = None
+        rs.seg_frame   = None
+        raise
+
+
+async def _anim_warm_loop(rs: RenderState, refresh, stop: asyncio.Event) -> None:
+    """Waves on the full bar while daemon is WARM — shows recent activity."""
+    try:
+        while not stop.is_set():
+            act, _ = _act(rs.daemon)
+            if act == "warm" and rs.bar_frame is None and not rs.active_effect:
+                bar_text = rs.daemon.bar_plain()
+                try:
+                    frames = await asyncio.to_thread(_gen_frames, Waves, bar_text, 80)
+                except Exception:
+                    await asyncio.sleep(1.0)
+                    continue
+                for frame in frames:
+                    if stop.is_set() or rs.active_effect:
+                        break
+                    act2, _ = _act(rs.daemon)
+                    if act2 != "warm":
+                        break
+                    rs.bar_frame = frame
+                    refresh()
+                    await asyncio.sleep(1 / 30)
+                rs.bar_frame = None
+                refresh()
+            await asyncio.sleep(0.3)
+    except asyncio.CancelledError:
+        rs.bar_frame = None
+        raise
+
+
+class AliveAnimator:
+    """Manages the three-layer alive animation stack with clean task lifecycle."""
+
+    def __init__(self, rs: RenderState, refresh):
+        self._rs      = rs
+        self._refresh = refresh
+        self._shimmer_stop = asyncio.Event()
+        self._idle_stop    = asyncio.Event()
+        self._warm_stop    = asyncio.Event()
+        self._shimmer_task: Optional[asyncio.Task] = None
+        self._idle_task:    Optional[asyncio.Task] = None
+        self._warm_task:    Optional[asyncio.Task] = None
+
+    def start(self):
+        self._shimmer_stop.clear()
+        self._idle_stop.clear()
+        self._warm_stop.clear()
+        self._shimmer_task = asyncio.create_task(
+            _shimmer_tick(self._rs, self._refresh, self._shimmer_stop)
+        )
+        self._idle_task = asyncio.create_task(
+            _anim_idle_loop(self._rs, self._refresh, self._idle_stop)
+        )
+        self._warm_task = asyncio.create_task(
+            _anim_warm_loop(self._rs, self._refresh, self._warm_stop)
+        )
+
+    def pause_tte(self):
+        """Pause TTE loops before a transition animation plays."""
+        self._idle_stop.set()
+        self._warm_stop.set()
+        if self._idle_task and not self._idle_task.done():
+            self._idle_task.cancel()
+        if self._warm_task and not self._warm_task.done():
+            self._warm_task.cancel()
+
+    def resume_tte(self):
+        """Resume TTE loops after a transition animation completes."""
+        self._idle_stop.clear()
+        self._warm_stop.clear()
+        self._idle_task = asyncio.create_task(
+            _anim_idle_loop(self._rs, self._refresh, self._idle_stop)
+        )
+        self._warm_task = asyncio.create_task(
+            _anim_warm_loop(self._rs, self._refresh, self._warm_stop)
+        )
+
+    async def stop(self):
+        self._shimmer_stop.set()
+        self._idle_stop.set()
+        self._warm_stop.set()
+        tasks = [t for t in [self._shimmer_task, self._idle_task, self._warm_task]
+                 if t and not t.done()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
 # ── Poller ────────────────────────────────────────────────────────────────────
 
 async def _poll_live(rs: RenderState, refresh) -> None:
     """Poll /tmp/qodo-statusline every 200ms; fire animations on field changes."""
-    prev = rs.daemon
+    prev      = rs.daemon
     anim_task: Optional[asyncio.Task] = None
+    alive     = AliveAnimator(rs, refresh)
+    alive.start()
 
-    while True:
-        await asyncio.sleep(0.2)
-        curr = _read_statusline()
-        if curr is None:
-            continue
+    try:
+        while True:
+            await asyncio.sleep(0.2)
+            curr = _read_statusline()
+            if curr is None:
+                continue
 
-        # Always update activity/hot for shimmer accuracy (no animation needed)
-        rs.daemon.activity_ms = curr.activity_ms
-        rs.daemon.hot_until   = curr.hot_until
+            rs.daemon.activity_ms = curr.activity_ms
+            rs.daemon.hot_until   = curr.hot_until
 
-        events = _diff(prev, curr)
+            events = _diff(prev, curr)
 
-        if events and (anim_task is None or anim_task.done()):
-            rs.daemon = curr
-            cls, scope, text, fps, mf, desc = events[0]
-            effect_name = cls.__name__
-            anim_task = asyncio.create_task(
-                _play_transition(cls, scope, text, fps, mf, effect_name, desc, rs, refresh)
-            )
-        elif not events:
-            rs.daemon = curr
-            refresh()
+            if events and (anim_task is None or anim_task.done()):
+                rs.daemon = curr
+                cls, scope, text, fps, mf, desc = events[0]
+                alive.pause_tte()
+                anim_task = asyncio.create_task(
+                    _play_transition(cls, scope, text, fps, mf,
+                                     cls.__name__, desc, rs, refresh)
+                )
+                # Resume alive loops once transition finishes
+                async def _resume_after(task):
+                    await asyncio.gather(task, return_exceptions=True)
+                    alive.resume_tte()
+                asyncio.create_task(_resume_after(anim_task))
+            elif not events:
+                rs.daemon = curr
 
-        prev = curr
+            prev = curr
+    finally:
+        await alive.stop()
 
 
 # ── Simulation mode ───────────────────────────────────────────────────────────
@@ -427,15 +594,16 @@ SIM_STEPS = [
 
 
 async def _poll_sim(rs: RenderState, refresh) -> None:
-    """Write fake state transitions and let the normal poller pick them up."""
-    tmp = STATUSLINE_PATH + ".tte-sim"
-    global STATUSLINE_PATH
-    STATUSLINE_PATH = tmp
+    """Simulate state transitions; drives the same animation engine as live mode."""
+    prev  = rs.daemon
+    alive = AliveAnimator(rs, refresh)
+    alive.start()
 
+    # Let the idle heartbeat play briefly before the first transition
+    await asyncio.sleep(1.5)
+
+    anim_task: Optional[asyncio.Task] = None
     try:
-        prev = rs.daemon
-        anim_task: Optional[asyncio.Task] = None
-
         for delay, line in SIM_STEPS:
             await asyncio.sleep(delay)
             curr = _parse(line)
@@ -447,25 +615,25 @@ async def _poll_sim(rs: RenderState, refresh) -> None:
             if events and (anim_task is None or anim_task.done()):
                 rs.daemon = curr
                 cls, scope, text, fps, mf, desc = events[0]
+                alive.pause_tte()
                 anim_task = asyncio.create_task(
                     _play_transition(cls, scope, text, fps, mf,
                                      cls.__name__, desc, rs, refresh)
                 )
+                async def _resume_after(task):
+                    await asyncio.gather(task, return_exceptions=True)
+                    alive.resume_tte()
+                asyncio.create_task(_resume_after(anim_task))
             else:
                 rs.daemon = curr
-                refresh()
 
             prev = curr
 
-        # Wait for last animation to finish
         if anim_task and not anim_task.done():
             await anim_task
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2.0)
     finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        await alive.stop()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
